@@ -62,9 +62,10 @@
 <script id="nas-params" type="application/json">{{PARAMS}}</script>
 <div id="info" class="chip"><b>char_run.glb</b><span id="status">loading model…</span></div>
 <div id="face" class="chip" role="group" aria-label="Face">
-  <div class="row"><span class="label">Eyes</span>
-    <button id="gaze-camera" type="button" aria-pressed="true">Follow camera</button>
-    <button id="gaze-pointer" type="button" aria-pressed="false">Follow pointer</button>
+  <div class="row"><span class="label">Look</span>
+    <button id="gaze-camera" type="button" aria-pressed="true">At camera</button>
+    <button id="gaze-pointer" type="button" aria-pressed="false">At pointer</button>
+    <button id="gaze-off" type="button" aria-pressed="false">Off</button>
     <button id="blink" type="button">Blink</button>
   </div>
   <form id="say" class="row"><span class="label">Say</span>
@@ -84,6 +85,7 @@
 <script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/loaders/GLTFLoader.js"></script>
 <script>{{NAS_SHADER_JS}}</script>
 <script>{{GENSHIN_JS}}</script>
+<script>{{PUPPET_JS}}</script>
 <script>
   const stage = document.getElementById('stage');
   const statusEl = document.getElementById('status');
@@ -152,13 +154,12 @@
   addEventListener('resize', resize);
   resize();
 
-  let mode = 'genshin', paused = false, model, genshin;
+  let mode = 'genshin', paused = false, model, genshin, puppet;
   const lightWrap = document.getElementById('light-wrap');
   function setMode(m) {
     mode = m;
     for (const k of ['genshin', 'nas', 'orig']) document.getElementById('mode-' + k).setAttribute('aria-pressed', m === k);
     lightWrap.hidden = m !== 'genshin';
-    document.getElementById('face').hidden = m !== 'genshin';
     if (!mesh) return;
     mesh.material = m === 'genshin' ? genshin.material : origMat;
     genshin.outline.visible = m === 'genshin';
@@ -192,6 +193,9 @@
     genshin = createGenshin(THREE, mesh, P);
     genshin.material.uniforms.map.value = rawMap;
     genshin.outline.material.uniforms.map.value = rawMap;
+    // Puppet the model's own face (mesh deformation + head/neck look-at) in every mode.
+    puppet = createFacePuppet(THREE, mesh);
+    for (const m of [origMat, albedoMat, normalMat, depthMat, genshin.material, genshin.outline.material]) puppet.patch(m);
 
     const box = new THREE.Box3().setFromObject(model);
     const size = box.getSize(new THREE.Vector3());
@@ -244,9 +248,9 @@
     renderer.render(quadScene, quadCam);
   }
 
-  // ---- Face animation: auto-blink, gaze target, text-driven visemes ----
+  // ---- Face puppet animation: look target, auto-blink, text-driven mouth shapes ----
   const faceAnim = {
-    gazeMode: 'camera', pointer: new THREE.Vector2(), gazeTarget: new THREE.Vector2(),
+    gazeMode: 'camera', pointer: new THREE.Vector2(), eyeOpen: 1,
     blinkT: -1, nextBlink: 2, speech: [], speechT: 0,
     mouth: { open: 0, width: 1 }, mouthTarget: { open: 0, width: 1 },
   };
@@ -266,39 +270,37 @@
   }
   document.getElementById('say').addEventListener('submit', (e) => { e.preventDefault(); speak(document.getElementById('say-text').value); });
   document.getElementById('blink').onclick = () => { faceAnim.blinkT = 0; };
-  for (const m of ['camera', 'pointer']) document.getElementById('gaze-' + m).onclick = () => {
+  for (const m of ['camera', 'pointer', 'off']) document.getElementById('gaze-' + m).onclick = () => {
     faceAnim.gazeMode = m;
-    for (const k of ['camera', 'pointer']) document.getElementById('gaze-' + k).setAttribute('aria-pressed', k === m);
+    for (const k of ['camera', 'pointer', 'off']) document.getElementById('gaze-' + k).setAttribute('aria-pressed', k === m);
   };
   renderer.domElement.addEventListener('pointermove', (e) => {
     const r = renderer.domElement.getBoundingClientRect();
     faceAnim.pointer.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
   });
   const _ray = new THREE.Raycaster(), _p = new THREE.Vector3();
+  // Sets the puppet's inputs for this frame (call before puppet.update).
   function updateFace(dt) {
-    const f = genshin.face, A = faceAnim;
-    // Gaze: toward the camera, or toward the point under the pointer at the head's depth.
-    // gazeMode 'manual': gazeTarget is set from outside (scripting/API).
-    if (A.gazeMode === 'camera') f.lookAtPoint(camera.position, A.gazeTarget);
+    const A = faceAnim;
+    // Look: toward the camera, toward the point under the pointer at the head's depth, or off.
+    puppet.lookEnabled = A.gazeMode !== 'off';
+    if (A.gazeMode === 'camera') puppet.lookTarget.copy(camera.position);
     else if (A.gazeMode === 'pointer') {
       _ray.setFromCamera(A.pointer, camera);
-      const c = genshin.material.uniforms.headCenter.value;
-      _ray.ray.at(_ray.ray.origin.distanceTo(c), _p);
-      f.lookAtPoint(_p, A.gazeTarget);
-      A.gazeTarget.multiplyScalar(2.2);
+      _ray.ray.at(_ray.ray.origin.distanceTo(controls.target) * 0.9, _p);
+      puppet.lookTarget.copy(_p);
     }
-    A.gazeTarget.clampScalar(-1, 1);
-    f.gaze.lerp(A.gazeTarget, 1 - Math.exp(-dt * 14));
-    // Blink: ~140 ms close/open, every 2-6 s.
+    // Blink: ~160 ms close/open, every 2-6 s.
     A.nextBlink -= dt;
     if (A.nextBlink <= 0 && A.blinkT < 0) { A.blinkT = 0; A.nextBlink = 2 + Math.random() * 4; }
     if (A.blinkT >= 0) {
       A.blinkT += dt;
       const t = A.blinkT / 0.16;
-      f.eyeOpen = t < 0.45 ? 1 - t / 0.45 : Math.min(1, (t - 0.55) / 0.45);
-      if (t >= 1) { A.blinkT = -1; f.eyeOpen = 1; }
+      A.eyeOpen = t < 0.45 ? 1 - t / 0.45 : Math.min(1, (t - 0.55) / 0.45);
+      if (t >= 1) { A.blinkT = -1; A.eyeOpen = 1; }
     }
-    // Speech: step through visemes, ease the mouth toward each target.
+    puppet.blink[0] = puppet.blink[1] = A.eyeOpen;
+    // Speech: step through mouth shapes, ease toward each target.
     if (A.speech.length) {
       A.speechT += dt;
       while (A.speech.length && A.speechT > A.speech[0].d) { A.speechT -= A.speech[0].d; A.speech.shift(); }
@@ -308,18 +310,20 @@
     const k = 1 - Math.exp(-dt * 22);
     A.mouth.open += (A.mouthTarget.open - A.mouth.open) * k;
     A.mouth.width += (A.mouthTarget.width - A.mouth.width) * k;
-    f.mouthOpen = A.mouth.open; f.mouthWidth = A.mouth.width;
+    puppet.mouthOpen = A.mouth.open; puppet.mouthWidth = A.mouth.width;
   }
 
   const clock = new THREE.Clock();
   renderer.setAnimationLoop(() => {
     const dt = clock.getDelta();
+    if (puppet) puppet.beginFrame();
     if (mixer && !paused && !matchMedia('(prefers-reduced-motion: reduce)').matches) mixer.update(dt);
+    if (puppet) { updateFace(dt); puppet.update(dt); }
     controls.update();
     if (mode === 'nas' && mesh) {
       renderNAS();
     } else {
-      if (mode === 'genshin' && genshin) { genshin.update(camera, renderer); updateFace(dt); }
+      if (mode === 'genshin' && genshin) genshin.update(camera, renderer);
       renderer.setRenderTarget(null);
       renderer.clear();
       renderer.render(scene, camera);

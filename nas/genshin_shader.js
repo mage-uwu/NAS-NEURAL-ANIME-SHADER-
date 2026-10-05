@@ -9,15 +9,10 @@
 //             segment), head/hair by a head sphere -> big painted shadow shapes, no mesh-fold noise
 //   angel     anisotropic (Kajiya-Kay) hair highlight with the tangent along the head's up axis, stepped:
 //             a thin band that wraps around the head ("angel ring"), tinted green
-//   face      procedural anime eyes + mouth drawn in head-local space over the painted ones:
-//             gaze (iris offset), blink (lid sweep + lash line), mouth open/width (visemes for speech).
-//             Coverage skips hair strands: anything floating well in front of a cubic face-surface fit
-//             (head-local z(x, y), fitted to skin in a calibration render) is fringe, so it stays on top.
 //   outline   inverted hull: back faces pushed out along smoothed normals, ~2.5px and heavier on the
 //             silhouette, colored as a darkened version of the surface underneath
 //
-// createGenshin(THREE, mesh, P) -> { material, outline, update(camera, renderer), setLightAzimuth(deg), face }
-//   face.gaze (Vector2, -1..1), face.eyeOpen (0..1), face.mouthOpen (0..1), face.mouthWidth (~0.6..1.3)
+// createGenshin(THREE, mesh, P) -> { material, outline, update(camera, renderer), setLightAzimuth(deg) }
 function createGenshin(THREE, mesh, P) {
   const vec3s = (flat) => Array.from({ length: flat.length / 3 }, (_, i) => new THREE.Vector3(flat[3*i], flat[3*i+1], flat[3*i+2]));
   const map = mesh.material.map;
@@ -69,15 +64,6 @@ function createGenshin(THREE, mesh, P) {
     clothShadow: { value: new THREE.Color(0.74, 0.84, 0.80) },
     angelColor: { value: new THREE.Color(0.55, 1.0, 0.45) },
     debugLocal: { value: 0 },  // 1: head-local face coords, 2: UVs (calibration)
-    // Face layout in head-local units (x right, y up, in head radii), measured with the calibration renders.
-    eyeA: { value: new THREE.Vector4(-0.387, -0.206, 0.17, 0.135) },  // her right eye: center, half-size
-    eyeB: { value: new THREE.Vector4(0.245, -0.18, 0.17, 0.135) },    // her left eye
-    mouth: { value: new THREE.Vector4(-0.116, -0.625, 0.105, 0.105) }, // center, half-width, max half-height
-    gaze: { value: new THREE.Vector2(0, 0) }, eyeOpen: { value: 1 },
-    mouthOpen: { value: 0 }, mouthWidth: { value: 1 },
-    skinTone: { value: new THREE.Color(0.988, 0.882, 0.80) },
-    // z_face(x, y): cubic in head-local x, y (head radii), fitted to skin in a calibration render (resid std 0.037)
-    faceFit: { value: [0.5239, -0.1684, 0.6862, -0.7158, 3.2962, -0.1908, 0.0465, 3.5262, 0.6349, -0.3110] },
   };
 
   const vertexShader = `
@@ -108,9 +94,6 @@ function createGenshin(THREE, mesh, P) {
     uniform float rampThr, rampSoft;
     uniform vec3 skinShadow, clothShadow, angelColor;
     uniform int debugLocal;
-    uniform vec4 eyeA, eyeB, mouth; uniform vec2 gaze; uniform float eyeOpen, mouthOpen, mouthWidth;
-    uniform vec3 skinTone;
-    uniform float faceFit[10];
     varying vec2 vUv;
     varying vec3 vPosW, vNormalW;
 
@@ -124,75 +107,6 @@ function createGenshin(THREE, mesh, P) {
         src += w * palSrc[k]; dst += w * palDst[k]; ws += w;
       }
       return clamp(dst / ws + flatDetail * (a - src / ws), 0.0, 1.0);
-    }
-
-    float band(float x, float lo, float hi, float aa) { return smoothstep(lo - aa, lo + aa, x) * (1.0 - smoothstep(hi - aa, hi + aa, x)); }
-
-    // Anime eye in eye units (q: -1..1 across the socket). side = +1 when the outer corner is at +x.
-    // Returns rgb + coverage.
-    vec4 drawEye(vec2 fl, vec4 E, float side) {
-      vec2 q = (fl - E.xy) / E.zw;
-      float cover = 1.0 - smoothstep(1.2, 1.35, length(q * vec2(0.72, 0.75)));  // wide: painted lashes flare out
-      if (cover <= 0.0) return vec4(0.0);
-      float aa = max(fwidth(q.y), fwidth(q.x)) * 0.75;
-      float qx = q.x * side;
-      vec3 col = skinTone;
-
-      float lidOpen = 0.95 - 0.45 * q.x * q.x - 0.10 * qx;        // upper lid, higher toward the inner corner
-      float lidClosed = -0.92 + 0.32 * q.x * q.x;                  // closed: lid meets the lower lid (U-shaped lash line)
-      float lid = mix(lidClosed, lidOpen, eyeOpen);
-      float bot = -0.88 + 0.32 * q.x * q.x;
-      float inside = band(q.y, bot, lid, aa) * (1.0 - smoothstep(1.0 - aa, 1.0 + aa, abs(q.x)));
-
-      // Sclera with a soft lid shadow.
-      vec3 sclera = mix(vec3(0.98, 0.98, 0.96), vec3(0.80, 0.86, 0.88), smoothstep(lid - 0.45, lid, q.y));
-      col = mix(col, sclera, inside);
-
-      // Iris + pupil + highlights, offset by gaze and clipped by the lids.
-      vec2 ic = vec2(0.0, -0.08) + gaze * vec2(0.42, 0.26);
-      vec2 ir = vec2(0.52, 0.70);
-      vec2 iq = (q - ic) / ir;
-      float d = length(iq);
-      float iris = inside * (1.0 - smoothstep(1.0 - aa * 2.0, 1.0, d));
-      vec3 irisCol = mix(vec3(0.42, 0.86, 0.30), vec3(0.05, 0.22, 0.08), smoothstep(-0.9, 0.6, iq.y));
-      irisCol = mix(irisCol, vec3(0.03, 0.14, 0.05), smoothstep(0.78, 0.95, d));          // dark limbal ring
-      irisCol = mix(irisCol, vec3(0.02, 0.09, 0.04), 1.0 - smoothstep(0.30, 0.36, length(iq * vec2(1.1, 0.9))));  // pupil
-      irisCol = mix(irisCol, vec3(1.0), 1.0 - smoothstep(0.16, 0.20, length(iq - vec2(-0.30 * side, 0.38))));  // key highlight
-      irisCol = mix(irisCol, vec3(0.85, 1.0, 0.85), 1.0 - smoothstep(0.07, 0.10, length(iq - vec2(0.28 * side, -0.42))));
-      col = mix(col, irisCol, iris);
-
-      // Upper lash: thick band above the lid with a flick at the outer corner. Lower lash: thin partial line.
-      vec3 lashCol = vec3(0.04, 0.10, 0.05);
-      float thick = 0.24 - 0.10 * q.x * q.x;
-      float upper = band(q.y, lid - 0.03, lid + thick, aa) * (1.0 - smoothstep(1.08 - aa, 1.08 + aa, abs(q.x)));
-      float lidAt1 = mix(-0.60, 0.40, eyeOpen);
-      float wingY = lidAt1 + (qx - 0.95) * 0.55;
-      float wing = band(qx, 0.95, 1.32, aa) * band(q.y, wingY - 0.02, wingY + 0.14 * (1.32 - qx) / 0.37, aa);
-      float lower = band(q.y, bot - 0.03, bot + 0.03, aa) * band(qx, -0.15, 0.9, aa) * smoothstep(0.2, 0.6, eyeOpen) * 0.7;
-      col = mix(col, lashCol, clamp(upper + wing, 0.0, 1.0));
-      col = mix(col, mix(col, lashCol, 0.8), lower);
-      return vec4(col, cover);
-    }
-
-    // Anime mouth: rounded "D" opening with interior, tongue, top teeth. Returns rgb + coverage.
-    vec4 drawMouth(vec2 fl) {
-      if (mouthOpen < 0.03) return vec4(0.0);
-      vec2 rel = fl - mouth.xy;
-      float cover = 1.0 - smoothstep(1.0, 1.25, length(rel / vec2(mouth.z * 1.35, mouth.z * 0.75)));
-      vec2 q = rel / vec2(mouth.z * mouthWidth, mouth.w * mouthOpen);
-      vec2 qq = vec2(q.x, q.y > 0.0 ? q.y * 1.6 : q.y);                 // flatter top lip
-      float d = length(qq);
-      float aa = max(fwidth(d), 0.02);
-      cover = max(cover, 1.0 - smoothstep(1.15, 1.3, d));
-      if (cover <= 0.0) return vec4(0.0);
-      vec3 col = skinTone;
-      float inside = 1.0 - smoothstep(1.0 - aa, 1.0 + aa, d);
-      vec3 mouthCol = vec3(0.45, 0.10, 0.13);
-      mouthCol = mix(mouthCol, vec3(0.88, 0.45, 0.48), 1.0 - smoothstep(0.55, 0.62, length(q - vec2(0.0, -0.85))));  // tongue
-      mouthCol = mix(mouthCol, vec3(1.0), band(qq.y, 0.62, 1.2, aa) * smoothstep(0.35, 0.55, mouthOpen));             // top teeth
-      col = mix(col, mouthCol, inside);
-      col = mix(col, vec3(0.25, 0.07, 0.07), band(d, 0.94, 1.08, aa));                                             // lip line
-      return vec4(col, cover);
     }
 
     // Soft-blended normal of the nearest bone capsules: what a painter would shade (a tube, not folds).
@@ -227,27 +141,6 @@ function createGenshin(THREE, mesh, P) {
       float hair = inHead * (1.0 - smoothstep(0.25, 0.4, dot(raw, vec3(0.299, 0.587, 0.114))));
       float face = inHead * skin * smoothstep(0.0, 0.35, dot(normalize(toHead), headFwd));
 
-      // Procedural face: repaint eyes + mouth in head-local space (before lighting, so they get cel shading).
-      vec2 fl = vec2(dot(toHead, headRight), dot(toHead, headUp)) / headRadius;
-      float facing = smoothstep(0.25, 0.4, dot(normalize(toHead), headFwd));
-      float fx = fl.x, fy = fl.y;
-      float zFace = faceFit[0] + faceFit[1] * fx + faceFit[2] * fy + faceFit[3] * fx * fx + faceFit[4] * fy * fy
-                  + faceFit[5] * fx * fy + faceFit[6] * fx * fx * fx + faceFit[7] * fy * fy * fy
-                  + faceFit[8] * fx * fx * fy + faceFit[9] * fx * fy * fy;
-      // Eyelids/nose stick out up to ~0.1; side-hair locks crossing the eye corners stand further out.
-      float hairStrand = smoothstep(0.11, 0.15, dot(toHead, headFwd) / headRadius - zFace);
-      float paintable = facing * (1.0 - hairStrand);
-      if (paintable > 0.0) {
-        vec4 e = drawEye(fl, eyeA, -1.0);
-        vec4 e2 = drawEye(fl, eyeB, 1.0);
-        vec4 m = drawMouth(fl);
-        base = mix(base, e.rgb, e.a * paintable);
-        base = mix(base, e2.rgb, e2.a * paintable);
-        base = mix(base, m.rgb, m.a * paintable);
-        float painted = max(max(e.a, e2.a), m.a) * paintable;
-        face = max(face, painted);   // repainted areas follow the face SDF shading
-        skin = max(skin, painted);
-      }
 
       // Flatten: replace mesh normals with proxy shapes (head sphere, bone capsules elsewhere).
       vec3 sphereN = normalize(toHead);
@@ -290,7 +183,7 @@ function createGenshin(THREE, mesh, P) {
       #include <encodings_fragment>
     }`;
 
-  const material = new THREE.ShaderMaterial({ uniforms, vertexShader, fragmentShader, extensions: { derivatives: true } });
+  const material = new THREE.ShaderMaterial({ uniforms, vertexShader, fragmentShader, });
 
   // ---- inverted-hull outline ----
   const outlineUniforms = {
@@ -360,17 +253,6 @@ function createGenshin(THREE, mesh, P) {
     uniforms.lightDir.value.set(Math.sin(a) * 0.8, 0.6, Math.cos(a) * 0.8).normalize();
   }
   setLightAzimuth(-35);
-  const face = {
-    get gaze() { return uniforms.gaze.value; },
-    get eyeOpen() { return uniforms.eyeOpen.value; }, set eyeOpen(v) { uniforms.eyeOpen.value = v; },
-    get mouthOpen() { return uniforms.mouthOpen.value; }, set mouthOpen(v) { uniforms.mouthOpen.value = v; },
-    get mouthWidth() { return uniforms.mouthWidth.value; }, set mouthWidth(v) { uniforms.mouthWidth.value = v; },
-    // Direction from the head toward a world point, in head-local (x right, y up) units.
-    lookAtPoint(p, out) {
-      const d = p.clone().sub(uniforms.headCenter.value).normalize();
-      return out.set(d.dot(uniforms.headRight.value), d.dot(uniforms.headUp.value));
-    },
-  };
-  return { material, outline, update, setLightAzimuth, face };
+  return { material, outline, update, setLightAzimuth };
 }
 if (typeof module !== 'undefined') module.exports = { createGenshin };
