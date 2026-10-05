@@ -34,21 +34,27 @@
     padding: 7px 12px; border-radius: 4px; cursor: pointer;
   }
   #controls button[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg); }
-  #controls button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  #controls button:focus-visible, #light:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  #light-wrap { display: flex; align-items: center; gap: 6px; padding: 0 8px; font-size: 13px; color: var(--muted); }
+  #light-wrap[hidden] { display: none; }
+  #light { width: 120px; accent-color: var(--accent); }
 </style>
 <div id="stage"></div>
 <script id="glb" type="application/octet-stream">{{GLB_B64}}</script>
 <script id="nas-params" type="application/json">{{PARAMS}}</script>
 <div id="info" class="chip"><b>char_run.glb</b><span id="status">loading model…</span></div>
 <div id="controls" class="chip" role="group" aria-label="Shading">
-  <button id="mode-nas" type="button" aria-pressed="true">NAS cel shader</button>
+  <button id="mode-genshin" type="button" aria-pressed="true">Genshin 2.5D</button>
+  <button id="mode-nas" type="button" aria-pressed="false">NAS cel</button>
   <button id="mode-orig" type="button" aria-pressed="false">Original</button>
   <button id="pause" type="button" aria-pressed="false">Pause</button>
+  <label id="light-wrap"><span>Light</span><input id="light" type="range" min="-180" max="180" step="1" value="-35" aria-label="Light angle around the character"></label>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/three@0.147.0/build/three.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/controls/OrbitControls.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/loaders/GLTFLoader.js"></script>
 <script>{{NAS_SHADER_JS}}</script>
+<script>{{GENSHIN_JS}}</script>
 <script>
   const stage = document.getElementById('stage');
   const statusEl = document.getElementById('status');
@@ -116,14 +122,18 @@
   addEventListener('resize', resize);
   resize();
 
-  let mode = 'nas', paused = false, model;
+  let mode = 'genshin', paused = false, model, genshin;
+  const lightWrap = document.getElementById('light-wrap');
   function setMode(m) {
     mode = m;
-    document.getElementById('mode-nas').setAttribute('aria-pressed', m === 'nas');
-    document.getElementById('mode-orig').setAttribute('aria-pressed', m === 'orig');
+    for (const k of ['genshin', 'nas', 'orig']) document.getElementById('mode-' + k).setAttribute('aria-pressed', m === k);
+    lightWrap.hidden = m !== 'genshin';
+    if (!mesh) return;
+    mesh.material = m === 'genshin' ? genshin.material : origMat;
+    genshin.outline.visible = m === 'genshin';
   }
-  document.getElementById('mode-nas').onclick = () => setMode('nas');
-  document.getElementById('mode-orig').onclick = () => setMode('orig');
+  for (const k of ['genshin', 'nas', 'orig']) document.getElementById('mode-' + k).onclick = () => setMode(k);
+  document.getElementById('light').oninput = (e) => genshin && genshin.setLightAzimuth(+e.target.value);
   document.getElementById('pause').onclick = (e) => {
     paused = !paused;
     e.currentTarget.setAttribute('aria-pressed', paused);
@@ -148,6 +158,9 @@
     rawMap.encoding = THREE.LinearEncoding;
     rawMap.needsUpdate = true;
     albedoMat = new THREE.MeshBasicMaterial({ map: rawMap });
+    genshin = createGenshin(THREE, mesh, P);
+    genshin.material.uniforms.map.value = rawMap;
+    genshin.outline.material.uniforms.map.value = rawMap;
 
     const box = new THREE.Box3().setFromObject(model);
     const size = box.getSize(new THREE.Vector3());
@@ -162,6 +175,7 @@
     gltf.animations.forEach((clip) => mixer.clipAction(clip).play());
     const clips = gltf.animations.map((a) => `${a.name} ${a.duration.toFixed(2)}s`).join(', ') || 'no animation';
     statusEl.textContent = `${clips} · drag to orbit · scroll to zoom`;
+    setMode(mode);
   }, (err) => {
     statusEl.textContent = 'Could not load char_run.glb: ' + (err.message || err);
   });
@@ -207,6 +221,7 @@
     if (mode === 'nas' && mesh) {
       renderNAS();
     } else {
+      if (mode === 'genshin' && genshin) genshin.update(camera, renderer);
       renderer.setRenderTarget(null);
       renderer.clear();
       renderer.render(scene, camera);
