@@ -129,6 +129,7 @@ function createGenshin(THREE, mesh, P) {
     void main() {
       vec3 raw = texture2D(map, vUv).rgb;           // texture bytes = sRGB
       vec3 base = palette(raw);                     // NAS palette, sRGB
+      // PUPPET_MOUTH(base)
       vec3 n = normalize(vNormalW);
       vec3 V = normalize(cameraPosition - vPosW);
       vec3 L = normalize(lightDir);

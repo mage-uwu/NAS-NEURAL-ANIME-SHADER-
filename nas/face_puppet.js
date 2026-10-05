@@ -9,14 +9,16 @@
 //           above follows down with a falloff to the brow, so the painted lashes fold into a closed line
 //   mouth   vertices are split at the painted mouth line: the lower lip drops, the upper lip lifts a
 //           little, and the lip region scales horizontally (vowel width). The painted mouth is a thin
-//           closed line, so this is a Live2D-style lip flap, kept small so the chin outline holds.
+//           closed line, so the triangles the split stretches open are shaded as the mouth interior
+//           (dark, tongue toward the lower lip): the opening's shape is the mesh's own gap.
 //   look    yaw/pitch toward a target added on top of the animation, 40% neck / 60% head
 //
 // Only vertices on the face surface move: a cubic fit of the face (z as a function of x, y, from a
 // calibration render) gates out back hair and the fringe hanging in front of the eyes.
 //
 // const puppet = createFacePuppet(THREE, mesh)
-//   puppet.patch(material)      inject the deformation into any material (built-in or ShaderMaterial)
+//   puppet.patch(material, colorSpace)  inject into any material; colorSpace 'srgb' | 'linear' for the
+//                                       mouth interior color (the space the material's color math runs in)
 //   puppet.beginFrame()         call before mixer.update (restores the un-turned head/neck pose)
 //   puppet.update(dt)           call after mixer.update: applies look-at, refreshes head frame uniforms
 //   puppet.blink[0|1], puppet.mouthOpen, puppet.mouthWidth, puppet.lookTarget (Vector3, world)
@@ -45,6 +47,8 @@ function createFacePuppet(THREE, mesh) {
     uniform vec4 puppetEyeA, puppetEyeB; uniform vec3 puppetMouth;
     uniform float puppetFaceFit[10];
     uniform vec2 puppetBlink; uniform float puppetMouthOpen, puppetMouthWidth;
+    varying float vPuppetSplit;   // 0 below the mouth line, 1 above; in between only on stretched triangles
+    varying vec2 vPuppetMouth;    // undeformed position relative to the mouth center (head radii)
 
     float puppetFaceZ(float x, float y) {
       float c[10]; for (int i = 0; i < 10; i++) c[i] = puppetFaceFit[i];
@@ -65,10 +69,12 @@ function createFacePuppet(THREE, mesh) {
       vec3 d = wp - puppetCenter;
       vec3 l = vec3(dot(d, puppetRight), dot(d, puppetUp), dot(d, puppetFwd)) / puppetRadius;
       // Only the face surface: near the fitted face z (not back hair, not the fringe floating in front).
-      if (l.z < 0.15 || l.y < -0.95 || l.y > 0.25 || abs(l.x) > 0.95) return wp;
+      vPuppetMouth = l.xy - puppetMouth.xy;
+      vPuppetSplit = step(0.0, vPuppetMouth.y);
+      if (l.z < 0.15 || l.y < -0.95 || l.y > 0.25 || abs(l.x) > 0.95) { vPuppetMouth = vec2(9.0); return wp; }
       float dz = l.z - puppetFaceZ(l.x, l.y);
       float gate = (1.0 - smoothstep(0.11, 0.15, dz)) * smoothstep(-0.25, -0.15, dz);
-      if (gate <= 0.0) return wp;
+      if (gate <= 0.0) { vPuppetMouth = vec2(9.0); return wp; }
       vec3 n = l;
       n.y = puppetEye(n.xy, puppetEyeA, puppetBlink.x);
       n.y = puppetEye(n.xy, puppetEyeB, puppetBlink.y);
@@ -76,7 +82,8 @@ function createFacePuppet(THREE, mesh) {
       vec2 m = l.xy - puppetMouth.xy;
       float reach = 1.0 - smoothstep(0.45, 1.0, length(m / vec2(puppetMouth.z * 2.2, puppetMouth.z * 1.3)));
       float split = smoothstep(-0.01, 0.01, m.y);
-      float amp = 0.05 * puppetMouthOpen;
+      vPuppetSplit = split;
+      float amp = 0.085 * puppetMouthOpen;
       n.y += mix(-amp, 0.35 * amp, split) * reach;
       n.x += m.x * (puppetMouthWidth - 1.0) * reach;
       vec3 out_l = mix(l, n, gate);
@@ -88,15 +95,34 @@ function createFacePuppet(THREE, mesh) {
       return (puppetModelInv * wp).xyz;
     }`;
 
+  // Mouth interior: where the split stretched triangles open (split strictly between the lips),
+  // within the mouth's width. Returns the interior color (sRGB) in rgb and its coverage in a.
+  const FRAG = `
+    uniform vec3 puppetMouth; uniform float puppetMouthOpen, puppetMouthWidth;
+    varying float vPuppetSplit;
+    varying vec2 vPuppetMouth;
+    vec4 puppetMouthInterior() {
+      float between = smoothstep(0.08, 0.2, vPuppetSplit) * (1.0 - smoothstep(0.8, 0.92, vPuppetSplit));
+      float across = 1.0 - smoothstep(0.7, 1.0, abs(vPuppetMouth.x) / (puppetMouth.z * puppetMouthWidth * 1.15));
+      float a = between * across * smoothstep(0.04, 0.2, puppetMouthOpen);
+      vec3 c = mix(vec3(0.86, 0.44, 0.48), vec3(0.36, 0.08, 0.11), smoothstep(0.2, 0.55, vPuppetSplit));
+      return vec4(c, a);
+    }`;
   function patchSource(vs) {
     if (vs.includes('puppetApply')) return vs;
     vs = vs.replace('void main() {', GLSL + '\nvoid main() {');
     return vs.replace('#include <skinning_vertex>', '#include <skinning_vertex>\n  transformed = puppetApply(transformed);');
   }
-  function patch(material) {
+  function patch(material, colorSpace = 'srgb') {
     if (material.isShaderMaterial) {
       Object.assign(material.uniforms, U);
       material.vertexShader = patchSource(material.vertexShader);
+      // ShaderMaterials opt in by marking where their base color is final with: // PUPPET_MOUTH(base)
+      const m = material.fragmentShader.match(/\/\/ PUPPET_MOUTH\((\w+)\)/);
+      if (m && !material.fragmentShader.includes('puppetMouthInterior')) {
+        material.fragmentShader = material.fragmentShader.replace('void main() {', FRAG + '\nvoid main() {')
+          .replace(m[0], `{ vec4 pm = puppetMouthInterior(); ${m[1]} = mix(${m[1]}, pm.rgb, pm.a); }`);
+      }
       material.needsUpdate = true;
       return material;
     }
@@ -105,6 +131,12 @@ function createFacePuppet(THREE, mesh) {
       if (prev) prev(shader, r);
       Object.assign(shader.uniforms, U);
       shader.vertexShader = patchSource(shader.vertexShader);
+      // Built-ins with a diffuse map: tint diffuseColor after the map is applied.
+      if (shader.fragmentShader.includes('#include <map_fragment>')) {
+        const col = colorSpace === 'linear' ? 'pow(pm.rgb, vec3(2.2))' : 'pm.rgb';
+        shader.fragmentShader = shader.fragmentShader.replace('void main() {', FRAG + '\nvoid main() {')
+          .replace('#include <map_fragment>', `#include <map_fragment>\n  { vec4 pm = puppetMouthInterior(); diffuseColor.rgb = mix(diffuseColor.rgb, ${col}, pm.a); }`);
+      }
     };
     material.customProgramCacheKey = () => 'face-puppet';
     material.needsUpdate = true;

@@ -44,6 +44,7 @@
   }
   #face[hidden] { display: none; }
   #face .row { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+  #say-status:empty { display: none; }
   #face .label { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); padding: 0 4px; }
   #face button {
     font: 13px var(--font-ui); color: var(--fg); background: transparent; border: 1px solid var(--grid);
@@ -71,7 +72,9 @@
   <form id="say" class="row"><span class="label">Say</span>
     <input id="say-text" type="text" value="Hi! I'm the Emerald Pixel Pixie. Nice to meet you!" aria-label="Text to speak">
     <button type="submit">Speak</button>
+    <button id="voice" type="button" aria-pressed="true">Voice on</button>
   </form>
+  <div id="say-status" class="label" aria-live="polite"></div>
 </div>
 <div id="controls" class="chip" role="group" aria-label="Shading">
   <button id="mode-genshin" type="button" aria-pressed="true">Genshin 2D</button>
@@ -195,7 +198,8 @@
     genshin.outline.material.uniforms.map.value = rawMap;
     // Puppet the model's own face (mesh deformation + head/neck look-at) in every mode.
     puppet = createFacePuppet(THREE, mesh);
-    for (const m of [origMat, albedoMat, normalMat, depthMat, genshin.material, genshin.outline.material]) puppet.patch(m);
+    puppet.patch(origMat, 'linear');  // PBR shading runs in linear
+    for (const m of [albedoMat, normalMat, depthMat, genshin.material, genshin.outline.material]) puppet.patch(m, 'srgb');
 
     const box = new THREE.Box3().setFromObject(model);
     const size = box.getSize(new THREE.Vector3());
@@ -256,19 +260,60 @@
   };
   // Viseme per letter: [open, width]. Vowels open the mouth; m/b/p close it; other consonants half-close.
   const VISEMES = { a: [1.0, 1.0], i: [0.35, 1.25], u: [0.5, 0.6], e: [0.55, 1.15], o: [0.8, 0.75], y: [0.35, 1.2] };
-  function speak(text) {
+  // Mouth timeline from text; each entry remembers its character index so the voice can resync it.
+  function visemes(text) {
     const seq = [];
-    for (const ch of text.toLowerCase()) {
-      if (VISEMES[ch]) seq.push({ v: VISEMES[ch], d: 0.11 });
-      else if ('mbp'.includes(ch)) seq.push({ v: [0, 0.9], d: 0.07 });
-      else if (/[a-z]/.test(ch)) seq.push({ v: [0.22, 1.0], d: 0.055 });
-      else if (/[.!?,]/.test(ch)) seq.push({ v: [0, 1], d: 0.28 });
-      else if (ch === ' ') seq.push({ v: [0.08, 1], d: 0.05 });
+    [...text.toLowerCase()].forEach((ch, ci) => {
+      if (VISEMES[ch]) seq.push({ v: VISEMES[ch], d: 0.11, ci });
+      else if ('mbp'.includes(ch)) seq.push({ v: [0, 0.9], d: 0.07, ci });
+      else if (/[a-z]/.test(ch)) seq.push({ v: [0.22, 1.0], d: 0.055, ci });
+      else if (/[.!?,]/.test(ch)) seq.push({ v: [0, 1], d: 0.28, ci });
+      else if (ch === ' ') seq.push({ v: [0.08, 1], d: 0.05, ci });
+    });
+    seq.push({ v: [0, 1], d: 0.2, ci: text.length });
+    return seq;
+  }
+  let voiceOn = true;
+  const sayStatus = document.getElementById('say-status');
+  function pickVoice() {
+    const voices = speechSynthesis.getVoices();
+    const en = voices.filter((v) => /^en/i.test(v.lang));
+    return en.find((v) => /female|samantha|zira|aria|jenny|google uk english female|karen|moira|tessa/i.test(v.name)) || en[0] || voices[0] || null;
+  }
+  function speak(text) {
+    const seq = visemes(text);
+    const startMouth = () => { faceAnim.speech = seq.slice(); faceAnim.speechT = 0; };
+    if (!voiceOn || !('speechSynthesis' in window)) {
+      sayStatus.textContent = voiceOn ? 'This browser has no speech voice; mouth only.' : '';
+      startMouth();
+      return;
     }
-    seq.push({ v: [0, 1], d: 0.2 });
-    faceAnim.speech = seq; faceAnim.speechT = 0;
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    const voice = pickVoice();
+    if (voice) u.voice = voice;
+    u.pitch = 1.6; u.rate = 1.05;
+    let started = false;
+    u.onstart = () => { started = true; sayStatus.textContent = ''; startMouth(); };
+    // Resync the mouth to each word the voice reaches.
+    u.onboundary = (e) => {
+      if (e.name && e.name !== 'word') return;
+      while (faceAnim.speech.length > 1 && faceAnim.speech[0].ci < e.charIndex) faceAnim.speech.shift();
+      faceAnim.speechT = 0;
+    };
+    u.onend = () => { faceAnim.speech = [{ v: [0, 1], d: 0.2, ci: 0 }]; faceAnim.speechT = 0; };
+    u.onerror = (e) => { if (!started) { sayStatus.textContent = `Voice unavailable (${e.error}); mouth only.`; startMouth(); } };
+    speechSynthesis.speak(u);
+    // If the voice never starts (blocked or no voices), still animate the mouth.
+    setTimeout(() => { if (!started) { sayStatus.textContent = 'No voice started; mouth only.'; startMouth(); } }, 900);
   }
   document.getElementById('say').addEventListener('submit', (e) => { e.preventDefault(); speak(document.getElementById('say-text').value); });
+  document.getElementById('voice').onclick = (e) => {
+    voiceOn = !voiceOn;
+    e.currentTarget.setAttribute('aria-pressed', voiceOn);
+    e.currentTarget.textContent = voiceOn ? 'Voice on' : 'Voice off';
+    if (!voiceOn && 'speechSynthesis' in window) speechSynthesis.cancel();
+  };
   document.getElementById('blink').onclick = () => { faceAnim.blinkT = 0; };
   for (const m of ['camera', 'pointer', 'off']) document.getElementById('gaze-' + m).onclick = () => {
     faceAnim.gazeMode = m;
