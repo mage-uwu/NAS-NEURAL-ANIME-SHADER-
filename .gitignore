@@ -1,0 +1,8 @@
+node_modules
+__pycache__/
+# Regenerable: node nas/export_gbuffers.mjs nas/data
+nas/data/
+nas/out/parity_*
+nas/out/train.log
+# Built by nas/build_viewer.py (embeds the 7 MB GLB)
+viewer.html

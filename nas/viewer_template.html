@@ -1,0 +1,215 @@
+<title>Pixie Run Viewer</title>
+<style>
+  /* Layout: one full-bleed WebGL stage, caption chip top-left, shader toggle bottom-center. */
+  :root {
+    --bg: #e9ecef; --fg: #1d2a26; --muted: #5d6b66; --chip: rgba(255,255,255,.82); --grid: #b9c2bf;
+    --accent: #2f8a4a; --accent-fg: #ffffff;
+    --font-ui: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    --font-data: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+    --bg: #1b1f1e; --fg: #e3ece8; --muted: #93a39d; --chip: rgba(20,24,23,.82); --grid: #3a4441;
+    --accent: #5cc77a; --accent-fg: #0f1a13; color-scheme: dark } }
+  :root[data-theme="dark"] {
+    --bg: #1b1f1e; --fg: #e3ece8; --muted: #93a39d; --chip: rgba(20,24,23,.82); --grid: #3a4441;
+    --accent: #5cc77a; --accent-fg: #0f1a13; color-scheme: dark }
+  html, body { height: 100%; }
+  body { background: var(--bg); color: var(--fg); font-family: var(--font-ui); overflow: hidden; }
+  #stage { position: fixed; inset: 0; }
+  #stage canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+  .chip { background: var(--chip); border-radius: 6px; backdrop-filter: blur(6px); }
+  #info {
+    position: fixed; left: 16px; top: calc(16px + env(safe-area-inset-top, 0px));
+    padding: 8px 12px; display: grid; gap: 2px; max-width: calc(100% - 32px);
+  }
+  #info b { font-size: 14px; }
+  #info span { font: 12px var(--font-data); color: var(--muted); }
+  #controls {
+    position: fixed; left: 50%; transform: translateX(-50%);
+    bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+    display: flex; gap: 4px; padding: 4px; flex-wrap: wrap; justify-content: center; max-width: calc(100% - 32px);
+  }
+  #controls button {
+    font: 13px var(--font-ui); color: var(--fg); background: transparent; border: 0;
+    padding: 7px 12px; border-radius: 4px; cursor: pointer;
+  }
+  #controls button[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg); }
+  #controls button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+</style>
+<div id="stage"></div>
+<script id="glb" type="application/octet-stream">{{GLB_B64}}</script>
+<script id="nas-params" type="application/json">{{PARAMS}}</script>
+<div id="info" class="chip"><b>char_run.glb</b><span id="status">loading model…</span></div>
+<div id="controls" class="chip" role="group" aria-label="Shading">
+  <button id="mode-nas" type="button" aria-pressed="true">NAS cel shader</button>
+  <button id="mode-orig" type="button" aria-pressed="false">Original</button>
+  <button id="pause" type="button" aria-pressed="false">Pause</button>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/loaders/GLTFLoader.js"></script>
+<script>{{NAS_SHADER_JS}}</script>
+<script>
+  const stage = document.getElementById('stage');
+  const statusEl = document.getElementById('status');
+  const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  const P = JSON.parse(document.getElementById('nas-params').textContent);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.outputEncoding = THREE.sRGBEncoding;
+  renderer.autoClear = false;
+  stage.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.2));
+  const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+  sun.position.set(2, 4, 3);
+  scene.add(sun);
+
+  let grid;
+  function applyTheme() {
+    scene.background = new THREE.Color(css('--bg'));
+    if (grid) scene.remove(grid);
+    grid = new THREE.GridHelper(4, 20, css('--grid'), css('--grid'));
+    if (charHeight) grid.scale.setScalar(charHeight / 1.6);
+    scene.add(grid);
+  }
+  let charHeight = 0;
+  applyTheme();
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
+  new MutationObserver(applyTheme).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+  const camera = new THREE.PerspectiveCamera(40, 1, 0.01, 100);
+  camera.position.set(0, 1, 3);
+  const controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.target.set(0, 0.8, 0);
+
+  // ---- NAS cel shader: G-buffer passes + one full-screen compositor (mirrors nas/shader.py) ----
+  const rtOpts = { minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, depthBuffer: true };
+  const rt = { albedo: new THREE.WebGLRenderTarget(1, 1, rtOpts), normal: new THREE.WebGLRenderTarget(1, 1, rtOpts),
+               depth: new THREE.WebGLRenderTarget(1, 1, rtOpts) };
+  const normalMat = new THREE.MeshNormalMaterial();
+  const depthMat = new THREE.MeshDepthMaterial();
+  let albedoMat, mesh, origMat;
+
+  const composite = createNASMaterial(THREE, P);
+  composite.uniforms.tAlbedo.value = rt.albedo.texture;
+  composite.uniforms.tNormal.value = rt.normal.texture;
+  composite.uniforms.tDepth.value = rt.depth.texture;
+  const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), composite);
+  quad.frustumCulled = false;
+  const quadScene = new THREE.Scene();
+  quadScene.add(quad);
+  const quadCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+  function resize() {
+    const w = stage.clientWidth, h = stage.clientHeight;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+    const s = renderer.getDrawingBufferSize(new THREE.Vector2());
+    for (const t of Object.values(rt)) t.setSize(s.x, s.y);
+    composite.uniforms.texel.value.set(1 / s.x, 1 / s.y);
+  }
+  addEventListener('resize', resize);
+  resize();
+
+  let mode = 'nas', paused = false, model;
+  function setMode(m) {
+    mode = m;
+    document.getElementById('mode-nas').setAttribute('aria-pressed', m === 'nas');
+    document.getElementById('mode-orig').setAttribute('aria-pressed', m === 'orig');
+  }
+  document.getElementById('mode-nas').onclick = () => setMode('nas');
+  document.getElementById('mode-orig').onclick = () => setMode('orig');
+  document.getElementById('pause').onclick = (e) => {
+    paused = !paused;
+    e.currentTarget.setAttribute('aria-pressed', paused);
+    e.currentTarget.textContent = paused ? 'Play' : 'Pause';
+  };
+
+  let mixer;
+  // The GLB is embedded as base64, since artifacts don't serve .glb files.
+  const b64 = document.getElementById('glb').textContent.trim();
+  const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  // GLTFLoader decodes embedded textures with fetch(blob:) when createImageBitmap exists,
+  // which the artifact sandbox blocks. Hide it while the parser is built so it falls back
+  // to TextureLoader (an <img> with a blob: src), which is allowed.
+  const savedCIB = window.createImageBitmap;
+  window.createImageBitmap = undefined;
+  new THREE.GLTFLoader().parse(bytes.buffer, '', (gltf) => {
+    model = gltf.scene;
+    scene.add(model);
+    model.traverse((o) => { if (o.isMesh) { mesh = o; origMat = o.material; } });
+    // Albedo pass writes the texture's raw sRGB bytes (no decode), matching the training G-buffers.
+    const rawMap = origMat.map.clone();
+    rawMap.encoding = THREE.LinearEncoding;
+    rawMap.needsUpdate = true;
+    albedoMat = new THREE.MeshBasicMaterial({ map: rawMap });
+
+    const box = new THREE.Box3().setFromObject(model);
+    const size = box.getSize(new THREE.Vector3());
+    model.position.y -= box.min.y;
+    charHeight = size.y;
+    grid.scale.setScalar(size.y / 1.6);
+    controls.target.set(0, size.y / 2, 0);
+    camera.position.set(size.y * 0.6, size.y * 0.7, size.y * 2.2);
+    controls.update();
+
+    mixer = new THREE.AnimationMixer(model);
+    gltf.animations.forEach((clip) => mixer.clipAction(clip).play());
+    const clips = gltf.animations.map((a) => `${a.name} ${a.duration.toFixed(2)}s`).join(', ') || 'no animation';
+    statusEl.textContent = `${clips} · drag to orbit · scroll to zoom`;
+  }, (err) => {
+    statusEl.textContent = 'Could not load char_run.glb: ' + (err.message || err);
+  });
+  window.createImageBitmap = savedCIB;
+
+  function gbufferPass(target, material) {
+    mesh.material = material;
+    renderer.setRenderTarget(target);
+    renderer.setClearColor(0x000000, 0);
+    renderer.clear();
+    renderer.render(model, camera);
+  }
+
+  function renderNAS() {
+    // Grid + background first, without the character.
+    model.visible = false;
+    renderer.setRenderTarget(null);
+    renderer.clear();
+    renderer.render(scene, camera);
+    model.visible = true;
+
+    gbufferPass(rt.albedo, albedoMat);
+    gbufferPass(rt.normal, normalMat);
+    // Depth uses the same tight near/far window as training (camera distance ± 0.6 × height).
+    const near = camera.near, far = camera.far;
+    const dist = camera.position.distanceTo(controls.target);
+    camera.near = Math.max(0.01, dist - charHeight * 0.6); camera.far = dist + charHeight * 0.6;
+    camera.updateProjectionMatrix();
+    gbufferPass(rt.depth, depthMat);
+    camera.near = near; camera.far = far;
+    camera.updateProjectionMatrix();
+    mesh.material = origMat;
+
+    renderer.setRenderTarget(null);
+    renderer.render(quadScene, quadCam);
+  }
+
+  const clock = new THREE.Clock();
+  renderer.setAnimationLoop(() => {
+    const dt = clock.getDelta();
+    if (mixer && !paused && !matchMedia('(prefers-reduced-motion: reduce)').matches) mixer.update(dt);
+    controls.update();
+    if (mode === 'nas' && mesh) {
+      renderNAS();
+    } else {
+      renderer.setRenderTarget(null);
+      renderer.clear();
+      renderer.render(scene, camera);
+    }
+  });
+</script>

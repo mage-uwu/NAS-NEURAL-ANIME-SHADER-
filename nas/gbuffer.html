@@ -1,0 +1,57 @@
+<!doctype html>
+<meta charset="utf-8">
+<!-- Headless G-buffer exporter for char_run.glb. Driven by nas/export_gbuffers.mjs. -->
+<body style="margin:0">
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/loaders/GLTFLoader.js"></script>
+<script>
+  const SIZE = 512;
+  const renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true, alpha: true });
+  renderer.setSize(SIZE, SIZE);
+  renderer.setClearColor(0x000000, 0);
+  renderer.outputEncoding = THREE.sRGBEncoding;
+  document.body.appendChild(renderer.domElement);
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(30, 1, 0.01, 100);
+
+  let mixer, mesh, height, origMat;
+  const normalMat = new THREE.MeshNormalMaterial();
+  const depthMat = new THREE.MeshDepthMaterial();
+  let albedoMat;
+
+  window.ready = new Promise((resolve) => {
+    new THREE.GLTFLoader().load('/char_run.glb', (gltf) => {
+      scene.add(gltf.scene);
+      gltf.scene.traverse((o) => { if (o.isMesh) { mesh = o; origMat = o.material; } });
+      albedoMat = new THREE.MeshBasicMaterial({ map: origMat.map });
+      const box = new THREE.Box3().setFromObject(gltf.scene);
+      gltf.scene.position.y -= box.min.y;
+      height = box.max.y - box.min.y;
+      mixer = new THREE.AnimationMixer(gltf.scene);
+      mixer.clipAction(gltf.animations[0]).play();
+      resolve({ duration: gltf.animations[0].duration, height });
+    });
+  });
+
+  // Render one view; returns PNG data URLs for each pass.
+  window.renderView = (t, azimuthDeg) => {
+    mixer.setTime(t);
+    const az = THREE.MathUtils.degToRad(azimuthDeg);
+    const dist = height * 2.3, cy = height * 0.5;
+    camera.position.set(Math.sin(az) * dist, cy + height * 0.12, Math.cos(az) * dist);
+    camera.lookAt(0, cy, 0);
+    // Tight near/far so 8-bit depth keeps useful precision across the character.
+    camera.near = dist - height * 0.6; camera.far = dist + height * 0.6;
+    camera.updateProjectionMatrix();
+    const out = {};
+    for (const [name, mat] of [['albedo', albedoMat], ['normal', normalMat], ['depth', depthMat]]) {
+      mesh.material = mat;
+      // Albedo is stored as sRGB (texture values); normal/depth are raw data, so no encoding.
+      renderer.outputEncoding = name === 'albedo' ? THREE.sRGBEncoding : THREE.LinearEncoding;
+      renderer.render(scene, camera);
+      out[name] = renderer.domElement.toDataURL('image/png');
+    }
+    mesh.material = origMat;
+    return out;
+  };
+</script>
