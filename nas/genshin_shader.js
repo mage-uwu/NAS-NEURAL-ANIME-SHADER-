@@ -5,12 +5,12 @@
 //   ramp      half-Lambert -> 2-band ramp with a soft edge; colored shadows (warm on skin, cool on cloth)
 //   face SDF  face shadow driven by light direction in the head frame, not by normals: a clean
 //             terminator that sweeps across the face as the light orbits (Genshin's face-shadow trick)
-//   flatten   hair/head normals pulled toward a sphere around the head -> big flat shading shapes
+//   flatten   2D-style normals: body normals replaced by bone-capsule normals (soft-blended nearest bone
+//             segment), head/hair by a head sphere -> big painted shadow shapes, no mesh-fold noise
 //   angel     anisotropic (Kajiya-Kay) hair highlight with the tangent along the head's up axis, stepped:
 //             a thin band that wraps around the head ("angel ring"), tinted green
-//   rim       stepped fresnel rim on the lit side only
-//   outline   inverted hull: back faces pushed out along smoothed normals at constant screen width,
-//             colored as a darkened version of the surface underneath
+//   outline   inverted hull: back faces pushed out along smoothed normals, ~2.5px and heavier on the
+//             silhouette, colored as a darkened version of the surface underneath
 //
 // createGenshin(THREE, mesh, P) -> { material, outline, update(camera, renderer), setLightAzimuth(deg) }
 function createGenshin(THREE, mesh, P) {
@@ -21,6 +21,13 @@ function createGenshin(THREE, mesh, P) {
   const bones = mesh.skeleton.bones;
   const bone = (suffix) => bones.find((b) => b.name.endsWith(suffix));
   const head = bone('Head'), headTop = bone('HeadTop_End'), headFront = bone('headfront');
+  // Capsule skeleton for normal flattening: [from, to] bone pairs.
+  const SEGMENTS = [['Hips', 'Neck'], ['Neck', 'Head']];
+  for (const side of ['Left', 'Right']) {
+    SEGMENTS.push([side + 'Arm', side + 'ForeArm'], [side + 'ForeArm', side + 'Hand'], [side + 'Hand', side + 'HandMiddle4'],
+                  [side + 'UpLeg', side + 'Leg'], [side + 'Leg', side + 'Foot'], [side + 'Foot', side + 'ToeBase']);
+  }
+  const segBones = SEGMENTS.map(([a, b]) => [bone(a), bone(b)]);
 
   // ---- smoothed normals for the outline hull (glTF splits normals at UV seams, which cracks the hull) ----
   const geo = mesh.geometry;
@@ -47,13 +54,15 @@ function createGenshin(THREE, mesh, P) {
     headCenter: { value: new THREE.Vector3() }, headRadius: { value: 0.1 },
     headFwd: { value: new THREE.Vector3(0, 0, 1) }, headRight: { value: new THREE.Vector3(1, 0, 0) },
     headUp: { value: new THREE.Vector3(0, 1, 0) },
+    segA: { value: segBones.map(() => new THREE.Vector3()) }, segB: { value: segBones.map(() => new THREE.Vector3()) },
+    segSigma: { value: 0.03 },
+    flatten: { value: 0.85 },
     // art direction
-    rampThr: { value: 0.5 }, rampSoft: { value: 0.035 },
+    rampThr: { value: 0.5 }, rampSoft: { value: 0.008 },
+    flatDetail: { value: 0.08 },  // texture detail kept on top of flat palette fills (NAS learned 0.27)
     skinShadow: { value: new THREE.Color(1.0, 0.80, 0.80) },
     clothShadow: { value: new THREE.Color(0.74, 0.84, 0.80) },
-    deepShadow: { value: new THREE.Color(0.62, 0.70, 0.70) },
     angelColor: { value: new THREE.Color(0.55, 1.0, 0.45) },
-    rimColor: { value: new THREE.Color(1.0, 1.0, 0.95) },
   };
 
   const vertexShader = `
@@ -76,11 +85,13 @@ function createGenshin(THREE, mesh, P) {
 
   const fragmentShader = `
     #define K ${P.pal_src.length / 3}
+    #define NSEG ${SEGMENTS.length}
     uniform sampler2D map;
+    uniform vec3 segA[NSEG], segB[NSEG]; uniform float segSigma, flatten, flatDetail;
     uniform vec3 palSrc[K], palDst[K]; uniform float palTemp, palDetail;
     uniform vec3 lightDir, headCenter, headFwd, headRight, headUp; uniform float headRadius;
     uniform float rampThr, rampSoft;
-    uniform vec3 skinShadow, clothShadow, deepShadow, angelColor, rimColor;
+    uniform vec3 skinShadow, clothShadow, angelColor;
     varying vec2 vUv;
     varying vec3 vPosW, vNormalW;
 
@@ -93,7 +104,24 @@ function createGenshin(THREE, mesh, P) {
         vec3 d = a - palSrc[k]; float w = exp(-(dot(d, d) - dmin) / palTemp);
         src += w * palSrc[k]; dst += w * palDst[k]; ws += w;
       }
-      return clamp(dst / ws + palDetail * (a - src / ws), 0.0, 1.0);
+      return clamp(dst / ws + flatDetail * (a - src / ws), 0.0, 1.0);
+    }
+
+    // Soft-blended normal of the nearest bone capsules: what a painter would shade (a tube, not folds).
+    vec3 capsuleNormal(vec3 p) {
+      vec3 acc = vec3(0.0); float wsum = 0.0, dmin = 1e9;
+      vec3 dirs[NSEG]; float ds[NSEG];
+      for (int i = 0; i < NSEG; i++) {
+        vec3 ab = segB[i] - segA[i];
+        float t = clamp(dot(p - segA[i], ab) / max(dot(ab, ab), 1e-8), 0.0, 1.0);
+        vec3 d = p - (segA[i] + t * ab);
+        ds[i] = dot(d, d); dirs[i] = d; dmin = min(dmin, ds[i]);
+      }
+      for (int i = 0; i < NSEG; i++) {
+        float w = exp(-(ds[i] - dmin) / (segSigma * segSigma));
+        acc += w * normalize(dirs[i] + 1e-6); wsum += w;
+      }
+      return normalize(acc / wsum);
     }
 
     void main() {
@@ -111,26 +139,24 @@ function createGenshin(THREE, mesh, P) {
       float hair = inHead * (1.0 - smoothstep(0.25, 0.4, dot(raw, vec3(0.299, 0.587, 0.114))));
       float face = inHead * skin * smoothstep(0.0, 0.35, dot(normalize(toHead), headFwd));
 
-      // Flatten: head normals pulled toward the head sphere (big, clean shading shapes on the hair).
+      // Flatten: replace mesh normals with proxy shapes (head sphere, bone capsules elsewhere).
       vec3 sphereN = normalize(toHead);
-      n = normalize(mix(n, sphereN, 0.6 * hair));
+      vec3 proxyN = normalize(mix(capsuleNormal(vPosW), sphereN, inHead));
+      n = normalize(mix(n, proxyN, flatten));
 
-      // Body ramp: half-Lambert -> two bands.
+      // One hard cel band (2D: a single shadow tone per material).
       float hl = dot(n, L) * 0.5 + 0.5;
       float lit = smoothstep(rampThr - rampSoft, rampThr + rampSoft, hl);
-      float deep = 1.0 - smoothstep(0.18, 0.24, hl);
 
       // Face SDF: in the head frame, a straight terminator that sweeps with the light's angle.
       vec3 Lh = normalize(L - headUp * dot(L, headUp) + 1e-4);
       float lf = dot(Lh, headFwd), lr = dot(Lh, headRight);
       float x = dot(toHead, headRight) / headRadius * (lr >= 0.0 ? 1.0 : -1.0);
-      float faceLit = smoothstep(-lf - 0.06, -lf + 0.06, x * 1.6);
+      float faceLit = smoothstep(-lf - 0.02, -lf + 0.02, x * 1.6);
       lit = mix(lit, faceLit, face);
-      deep *= 1.0 - face;
 
       vec3 shadowTint = mix(clothShadow, skinShadow, skin);
       vec3 col = base * mix(shadowTint, vec3(1.0), lit);
-      col *= mix(vec3(1.0), deepShadow, deep * (1.0 - lit));
 
       // Angel ring: Kajiya-Kay with hair strands running along head-up -> a band that wraps the head.
       vec3 H = normalize(L + V);
@@ -138,12 +164,8 @@ function createGenshin(THREE, mesh, P) {
       float sinTH = sqrt(max(1.0 - pow(dot(T, H), 2.0), 0.0));
       float upper = smoothstep(0.05, 0.3, dot(toHead, headUp) / headRadius);  // crown, not the fringe tips
       float frontLit = smoothstep(-0.2, 0.3, dot(normalize(L - headUp * dot(L, headUp) + 1e-4), headFwd));
-      float ring = smoothstep(0.986, 0.993, sinTH) * hair * upper * lit * frontLit;
+      float ring = smoothstep(0.9935, 0.995, sinTH) * hair * upper * lit * frontLit;
       col = mix(col, angelColor, ring * 0.6);
-
-      // Rim: stepped fresnel on the lit side.
-      float rim = smoothstep(0.66, 0.70, 1.0 - max(dot(normalize(vNormalW), V), 0.0)) * smoothstep(0.0, 0.2, dot(normalize(vNormalW), L));
-      col = mix(col, rimColor * base * 1.3, rim * 0.5);
 
       gl_FragColor = vec4(srgbToLinear(clamp(col, 0.0, 1.0)), 1.0);  // renderer encodes back to sRGB
       #include <encodings_fragment>
@@ -154,8 +176,8 @@ function createGenshin(THREE, mesh, P) {
   // ---- inverted-hull outline ----
   const outlineUniforms = {
     map: { value: map },
-    width: { value: 1.6 }, resolution: { value: new THREE.Vector2(1, 1) },
-    tint: { value: new THREE.Color(0.30, 0.42, 0.32) },
+    width: { value: 2.4 }, resolution: { value: new THREE.Vector2(1, 1) },
+    tint: { value: new THREE.Color(0.20, 0.30, 0.22) },
   };
   const outlineMat = new THREE.ShaderMaterial({
     uniforms: outlineUniforms, side: THREE.BackSide,
@@ -175,7 +197,8 @@ function createGenshin(THREE, mesh, P) {
         vec4 clip = projectionMatrix * modelViewMatrix * vec4(transformed, 1.0);
         vec3 nView = normalize(normalMatrix * objectNormal);
         vec2 dir = normalize(nView.xy + 1e-5);
-        clip.xy += dir * width * 2.0 / resolution * clip.w;  // constant width in pixels
+        float sil = 1.0 - abs(nView.z);                       // heavier where the surface turns away
+        clip.xy += dir * width * mix(0.6, 1.25, sil) * 2.0 / resolution * clip.w;  // width in pixels
         gl_Position = clip;
       }`,
     fragmentShader: `
@@ -209,7 +232,9 @@ function createGenshin(THREE, mesh, P) {
     uniforms.headRight.value.copy(new THREE.Vector3().crossVectors(up, fwd).normalize());
     const s = renderer.getDrawingBufferSize(new THREE.Vector2());
     outlineUniforms.resolution.value.copy(s);
-    outlineUniforms.width.value = 1.6 * renderer.getPixelRatio();
+    outlineUniforms.width.value = 2.4 * renderer.getPixelRatio();
+    segBones.forEach(([a, b], i) => { a.getWorldPosition(uniforms.segA.value[i]); b.getWorldPosition(uniforms.segB.value[i]); });
+    uniforms.segSigma.value = c.distanceTo(top) * 0.35;
   }
   function setLightAzimuth(deg) {
     const a = THREE.MathUtils.degToRad(deg);
